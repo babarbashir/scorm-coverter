@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SCORM Converter</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg width="26" height="26" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2 3 6.5v11L12 22l9-4.5v-11L12 2Zm0 2.2 6.6 3.3L12 10.8 5.4 7.5 12 4.2ZM5 9.1l6 3v7.6l-6-3V9.1Zm8 10.6v-7.6l6-3v7.6l-6 3Z"/></svg>
+    <span>SCORM Converter</span>
+  </div>
+  <p class="tagline">MP4 · PDF · PPTX · DOCX → SCORM 1.2 / 2004</p>
+</header>
+
+<main class="wrap">
+  <section class="card" id="form-card">
+    <form id="form" novalidate>
+      <label class="drop" id="drop" for="file">
+        <input type="file" id="file" name="file" accept=".mp4,.m4v,.pdf,.pptx,.docx,video/mp4,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden>
+        <div class="drop-empty">
+          <svg width="40" height="40" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M11 16V7.8l-2.6 2.6L7 9l5-5 5 5-1.4 1.4L13 7.8V16h-2Zm-5 4a2 2 0 0 1-2-2v-3h2v3h12v-3h2v3a2 2 0 0 1-2 2H6Z"/></svg>
+          <strong>Drop a file here or click to browse</strong>
+          <span>MP4, PDF, PPTX or DOCX · up to 500 MB</span>
+        </div>
+        <div class="drop-file" hidden>
+          <span class="file-badge" id="file-badge">PDF</span>
+          <span class="file-meta"><strong id="file-name"></strong><span id="file-size"></span></span>
+          <button type="button" class="link" id="file-clear">Change</button>
+        </div>
+      </label>
+      <p class="field-error" id="file-error" role="alert"></p>
+
+      <div class="grid">
+        <div class="field full">
+          <label for="title">Course title</label>
+          <input type="text" id="title" name="title" maxlength="200" placeholder="Shown in the LMS catalogue">
+        </div>
+
+        <div class="field full">
+          <span class="label">SCORM version</span>
+          <div class="seg" role="radiogroup" aria-label="SCORM version" id="versions">
+            <label><input type="radio" name="version" value="1.2" checked><span>SCORM 1.2</span></label>
+            <label><input type="radio" name="version" value="2004-3"><span>2004 3rd Ed.</span></label>
+            <label><input type="radio" name="version" value="2004-4"><span>2004 4th Ed.</span></label>
+          </div>
+          <p class="hint">SCORM 1.2 is the most widely supported. Pick 2004 if your LMS asks for it.</p>
+        </div>
+
+        <div class="field full">
+          <span class="label">Mark as complete when</span>
+          <div class="radios">
+            <label class="radio"><input type="radio" name="completion" value="progress" checked>
+              <span>The learner has <span id="progress-verb">viewed</span>
+                <input type="number" id="threshold" name="threshold" min="1" max="100" value="100" aria-label="Completion percentage"> %
+                of the <span id="progress-noun">pages</span></span></label>
+            <label class="radio"><input type="radio" name="completion" value="launch"><span>The learner opens it</span></label>
+          </div>
+        </div>
+
+        <details class="field full advanced">
+          <summary>Tracking options</summary>
+          <label class="check"><input type="checkbox" name="passOnComplete"> <span>Report <b>passed</b> as well as completed <small>Useful for LMSs that only count "passed" in their reports</small></span></label>
+          <label class="check"><input type="checkbox" name="reportScore"> <span>Report a score of 100% on completion <small>For LMSs that require a score to close the record</small></span></label>
+          <label class="check video-only" hidden><input type="checkbox" name="restrictSeek"> <span>Stop learners skipping ahead <small>They can only seek back to parts they have already watched</small></span></label>
+        </details>
+      </div>
+
+      <div class="actions">
+        <button type="submit" class="btn primary" id="submit" disabled>Convert to SCORM</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="card" id="progress-card" hidden>
+    <div class="job-head">
+      <span class="file-badge" id="job-badge">PDF</span>
+      <div>
+        <strong id="job-title"></strong>
+        <div class="muted" id="job-sub"></div>
+      </div>
+    </div>
+    <div class="bar"><span id="bar-fill"></span></div>
+    <div class="bar-label"><span id="stage-text">Uploading…</span><span id="pct-text">0%</span></div>
+    <p class="field-error" id="job-error" role="alert"></p>
+
+    <div id="done" hidden>
+      <div class="success">
+        <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9.5 16.2 5.3 12l-1.4 1.4 5.6 5.6 11-11-1.4-1.4z"/></svg>
+        <span>Your SCORM package is ready<span id="done-size"></span></span>
+      </div>
+      <ul class="warnings" id="warnings"></ul>
+      <div class="actions">
+        <a class="btn primary" id="download" href="#">Download .zip</a>
+        <a class="btn" id="preview" href="#" target="_blank" rel="noopener">Test in LMS simulator</a>
+        <button type="button" class="btn ghost" id="again">Convert another file</button>
+      </div>
+      <p class="hint">Upload the .zip as-is to your LMS. Don't unzip it first.</p>
+    </div>
+    <div class="actions" id="retry-row" hidden>
+      <button type="button" class="btn" id="retry">Start over</button>
+    </div>
+  </section>
+
+  <section class="notes">
+    <h2>What you get</h2>
+    <ul>
+      <li><b>Standard packages.</b> Includes <code>imsmanifest.xml</code> and the official ADL schema files, with a single SCO launching <code>index.html</code>.</li>
+      <li><b>Tracking.</b> Completion, a resume position, session time and progress are all reported to the LMS.</li>
+      <li><b>No external calls.</b> The player, PDF viewer and fonts are all inside the package, so it works on locked-down networks.</li>
+      <li><b>Documents.</b> PPTX and DOCX files are converted to PDF first. Slide animations and embedded audio or video are not carried over.</li>
+    </ul>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

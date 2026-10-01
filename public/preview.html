@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LMS Simulator</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --text:#1c2024; --muted:#5f6873; --border:#dde1e6; --accent:#2563eb; --ok:#15803d; --err:#c62828; --code:#f0f2f5; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111418; --card:#1a1e23; --text:#e6e8eb; --muted:#9aa3ad; --border:#2e343b; --accent:#4c8dff; --ok:#4ade80; --err:#ff6b6b; --code:#14181c; } }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--card); flex-wrap: wrap; }
+  header h1 { font-size: 15px; margin: 0; flex: 1; min-width: 200px; }
+  header .tag { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--code); color: var(--muted); font-weight: 600; }
+  button { height: 32px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); font: inherit; font-weight: 600; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .main { flex: 1; display: flex; min-height: 0; }
+  .frame { flex: 1; min-width: 0; background: #000; }
+  .frame iframe { width: 100%; height: 100%; border: 0; display: block; }
+  aside { width: 380px; flex: 0 0 auto; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--card); min-height: 0; }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 14px 14px 6px; }
+  table { width: calc(100% - 28px); margin: 0 14px; border-collapse: collapse; font-size: 12px; }
+  td { padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: top; word-break: break-all; }
+  td:first-child { color: var(--muted); width: 48%; font-family: ui-monospace, Menlo, monospace; }
+  td.good { color: var(--ok); font-weight: 600; }
+  #log { flex: 1; overflow: auto; margin: 0 14px 14px; padding: 8px; background: var(--code); border-radius: 6px; font: 11px/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
+  #log .err { color: var(--err); }
+  @media (max-width: 800px) { .main { flex-direction: column; } aside { width: auto; height: 45%; border-left: 0; border-top: 1px solid var(--border); } }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">LMS Simulator</h1>
+  <span class="tag" id="ver"></span>
+  <button id="relaunch" title="Close and reopen the course, like a learner returning later">Exit &amp; relaunch</button>
+  <button id="reset" title="Clear all saved data and start a new attempt">New attempt</button>
+</header>
+<div class="main">
+  <div class="frame"><iframe id="sco" title="Course content" allow="fullscreen" allowfullscreen></iframe></div>
+  <aside>
+    <h2>Learner record</h2>
+    <table id="state"></table>
+    <h2>API calls</h2>
+    <div id="log"></div>
+  </aside>
+</div>
+<script>
+(function () {
+  'use strict';
+  var id = location.pathname.split('/').pop();
+  var iframe = document.getElementById('sco');
+  var logEl = document.getElementById('log');
+  var version = null;
+  var store = {};           // persisted learner record (survives relaunch)
+  var session = null;       // per-launch runtime state
+
+  function log(msg, isErr) {
+    var line = document.createElement('div');
+    if (isErr) line.className = 'err';
+    line.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  // ------------------------------------------------------------------
+  // Data model rules (the subset a single-SCO package uses), strict
+  // enough to flag invalid values the way a real LMS would.
+  // ------------------------------------------------------------------
+  var M12 = {
+    'cmi.core.student_id': { ro: true }, 'cmi.core.student_name': { ro: true },
+    'cmi.core.lesson_location': { max: 255 }, 'cmi.core.credit': { ro: true },
+    'cmi.core.lesson_status': { vocab: ['passed', 'completed', 'failed', 'incomplete', 'browsed', 'not attempted'] },
+    'cmi.core.entry': { ro: true }, 'cmi.core.total_time': { ro: true }, 'cmi.core.lesson_mode': { ro: true },
+    'cmi.core.exit': { wo: true, vocab: ['time-out', 'suspend', 'logout', ''] },
+    'cmi.core.session_time': { wo: true, re: /^\d{2,4}:\d{2}:\d{2}(\.\d{1,2})?$/ },
+    'cmi.core.score.raw': { num: [0, 100], blank: true }, 'cmi.core.score.min': { num: [0, 100], blank: true }, 'cmi.core.score.max': { num: [0, 100], blank: true },
+    'cmi.suspend_data': { max: 4096 }, 'cmi.launch_data': { ro: true },
+  };
+  var M2004 = {
+    'cmi.learner_id': { ro: true }, 'cmi.learner_name': { ro: true }, 'cmi.location': { max: 1000 },
+    'cmi.completion_status': { vocab: ['completed', 'incomplete', 'not attempted', 'unknown'] },
+    'cmi.success_status': { vocab: ['passed', 'failed', 'unknown'] },
+    'cmi.entry': { ro: true }, 'cmi.mode': { ro: true }, 'cmi.credit': { ro: true }, 'cmi.total_time': { ro: true },
+    'cmi.exit': { wo: true, vocab: ['time-out', 'suspend', 'logout', 'normal', ''] },
+    'cmi.session_time': { wo: true, re: /^P(?:\d+Y)?(?:\d+M)?(?:\d+D)?(?:T(?:\d+H)?(?:\d+M)?(?:\d+(?:\.\d{1,2})?S)?)?$/ },
+    'cmi.progress_measure': { num: [0, 1] }, 'cmi.score.scaled': { num: [-1, 1] },
+    'cmi.score.raw': { num: [-1e9, 1e9] }, 'cmi.score.min': { num: [-1e9, 1e9] }, 'cmi.score.max': { num: [-1e9, 1e9] },
+    'cmi.suspend_data': { max: 64000 }, 'cmi.launch_data': { ro: true },
+  };
+
+  function makeApi(v) {
+    var model = v === '1.2' ? M12 : M2004;
+    var err = '0';
+    var errText = { '0': 'No error', '101': 'General exception', '103': 'Already initialized', '104': 'Content instance terminated', '112': 'Termination before initialization', '122': 'Retrieve data before initialization', '132': 'Store data before initialization', '142': 'Commit before initialization', '201': 'Invalid argument', '301': 'Not initialized', '351': 'Incorrect data type', '401': 'Not implemented', '403': 'Element not initialized', '404': 'Element is read only', '405': 'Element is write only', '406': 'Type mismatch', '407': 'Value out of range' };
+
+    function fail(code, what) { err = code; log('✗ ' + what + ' → error ' + code + ' ' + (errText[code] || ''), true); return 'false'; }
+
+    function init(name) {
+      if (session.state === 'running') return fail(v === '1.2' ? '101' : '103', name + '()');
+      if (session.state === 'terminated') return fail(v === '1.2' ? '101' : '104', name + '()');
+      session.state = 'running'; err = '0'; log(name + '("") → true'); render(); return 'true';
+    }
+    function get(name, k) {
+      if (session.state !== 'running') return (fail(v === '1.2' ? '301' : '122', name + '(' + k + ')'), '');
+      var rule = model[k];
+      if (!rule) { log(name + '("' + k + '") → "" (unsupported)'); err = '401'; return ''; }
+      if (rule.wo) return (fail(v === '1.2' ? '404' : '405', name + '(' + k + ')'), '');
+      err = '0';
+      var val = store[k] != null ? store[k] : '';
+      log(name + '("' + k + '") → "' + (val.length > 60 ? val.slice(0, 60) + '…' : val) + '"');
+      return val;
+    }
+    function set(name, k, val) {
+      val = String(val);
+      var what = name + '("' + k + '", "' + (val.length > 60 ? val.slice(0, 60) + '…' : val) + '")';
+      if (session.state !== 'running') return fail(v === '1.2' ? '301' : '132', what);
+      var rule = model[k];
+      if (!rule) return fail(v === '1.2' ? '401' : '401', what);
+      if (rule.ro) return fail(v === '1.2' ? '403' : '404', what);
+      if (rule.vocab && rule.vocab.indexOf(val) < 0) return fail(v === '1.2' ? '405' : '406', what);
+      if (rule.re && !rule.re.test(val)) return fail(v === '1.2' ? '405' : '406', what);
+      if (rule.max && val.length > rule.max) return fail(v === '1.2' ? '405' : '407', what + ' (length ' + val.length + ')');
+      if (rule.num && !(rule.blank && val === '')) {
+        var n = Number(val);
+        if (val === '' || isNaN(n)) return fail(v === '1.2' ? '405' : '406', what);
+        if (n < rule.num[0] || n > rule.num[1]) return fail(v === '1.2' ? '405' : '407', what);
+      }
+      err = '0';
+      session.pending[k] = val;
+      log(what + ' → true');
+      return 'true';
+    }
+    function commit(name) {
+      if (session.state !== 'running') return fail(v === '1.2' ? '301' : '142', name + '()');
+      for (var k in session.pending) store[k] = session.pending[k];
+      session.pending = {};
+      err = '0'; log(name + '("") → true'); render(); return 'true';
+    }
+    function finish(name) {
+      if (session.state !== 'running') return fail(v === '1.2' ? '301' : '112', name + '()');
+      commit(v === '1.2' ? 'LMSCommit' : 'Commit');
+      session.state = 'terminated';
+      err = '0'; log(name + '("") → true'); render(); return 'true';
+    }
+    var lastErr = function () { return err; };
+    var errStr = function (c) { return errText[String(c)] || ''; };
+    var diag = function (c) { return errText[String(c)] || ''; };
+
+    if (v === '1.2') return {
+      LMSInitialize: function () { return init('LMSInitialize'); },
+      LMSGetValue: function (k) { return get('LMSGetValue', k); },
+      LMSSetValue: function (k, val) { return set('LMSSetValue', k, val); },
+      LMSCommit: function () { return commit('LMSCommit'); },
+      LMSFinish: function () { return finish('LMSFinish'); },
+      LMSGetLastError: lastErr, LMSGetErrorString: errStr, LMSGetDiagnostic: diag,
+    };
+    return {
+      Initialize: function () { return init('Initialize'); },
+      GetValue: function (k) { return get('GetValue', k); },
+      SetValue: function (k, val) { return set('SetValue', k, val); },
+      Commit: function () { return commit('Commit'); },
+      Terminate: function () { return finish('Terminate'); },
+      GetLastError: lastErr, GetErrorString: errStr, GetDiagnostic: diag,
+    };
+  }
+
+  function freshRecord() {
+    store = {};
+    if (version === '1.2') {
+      store['cmi.core.student_id'] = 'learner-001'; store['cmi.core.student_name'] = 'Learner, Test';
+      store['cmi.core.lesson_status'] = 'not attempted'; store['cmi.core.lesson_mode'] = 'normal';
+      store['cmi.core.credit'] = 'credit'; store['cmi.core.entry'] = 'ab-initio'; store['cmi.core.total_time'] = '0000:00:00';
+    } else {
+      store['cmi.learner_id'] = 'learner-001'; store['cmi.learner_name'] = 'Learner, Test';
+      store['cmi.completion_status'] = 'not attempted'; store['cmi.success_status'] = 'unknown';
+      store['cmi.mode'] = 'normal'; store['cmi.credit'] = 'credit'; store['cmi.entry'] = 'ab-initio'; store['cmi.total_time'] = 'PT0S';
+    }
+  }
+
+  function launch() {
+    // Resume if the previous session exited with "suspend".
+    var exitKey = version === '1.2' ? 'cmi.core.exit' : 'cmi.exit';
+    var entryKey = version === '1.2' ? 'cmi.core.entry' : 'cmi.entry';
+    if (session) store[entryKey] = store[exitKey] === 'suspend' ? 'resume' : '';
+    delete store[exitKey];
+    session = { state: 'new', pending: {} };
+    var api = makeApi(version);
+    delete window.API; delete window.API_1484_11;
+    if (version === '1.2') window.API = api; else window.API_1484_11 = api;
+    log('— launching SCO (' + (store[entryKey] || 'ab-initio') + ') —');
+    iframe.src = '/pkg/' + id + '/index.html?t=' + Date.now();
+    render();
+  }
+
+  var SHOW = {
+    '1.2': ['cmi.core.lesson_status', 'cmi.core.lesson_location', 'cmi.core.score.raw', 'cmi.core.session_time', 'cmi.core.exit', 'cmi.core.entry', 'cmi.suspend_data'],
+    '2004': ['cmi.completion_status', 'cmi.success_status', 'cmi.progress_measure', 'cmi.location', 'cmi.score.scaled', 'cmi.session_time', 'cmi.exit', 'cmi.entry', 'cmi.suspend_data'],
+  };
+  function render() {
+    var t = document.getElementById('state');
+    var rows = [['Session', session ? session.state : '-']];
+    SHOW[version].forEach(function (k) { rows.push([k, store[k] == null ? '' : store[k]]); });
+    t.innerHTML = '';
+    rows.forEach(function (r) {
+      var tr = document.createElement('tr');
+      var a = document.createElement('td'); a.textContent = r[0];
+      var b = document.createElement('td'); b.textContent = r[1].length > 80 ? r[1].slice(0, 80) + '… (' + r[1].length + ' chars)' : r[1];
+      if (/^(completed|passed)$/.test(r[1])) b.className = 'good';
+      tr.appendChild(a); tr.appendChild(b); t.appendChild(tr);
+    });
+  }
+
+  document.getElementById('relaunch').onclick = function () {
+    iframe.src = 'about:blank';   // triggers the SCO's unload handlers
+    setTimeout(function () {
+      if (session.state === 'running') log('⚠ SCO did not call Terminate/LMSFinish on unload', true);
+      launch();
+    }, 400);
+  };
+  document.getElementById('reset').onclick = function () {
+    iframe.src = 'about:blank';
+    setTimeout(function () { logEl.innerHTML = ''; freshRecord(); session = null; launch(); }, 300);
+  };
+
+  fetch('/api/jobs/' + id).then(function (r) { return r.json(); }).then(function (job) {
+    version = job.version === '1.2' ? '1.2' : '2004';
+    document.getElementById('title').textContent = job.title;
+    document.getElementById('ver').textContent = job.versionLabel;
+    document.title = 'LMS Simulator: ' + job.title;
+    freshRecord();
+    launch();
+  });
+})();
+</script>
+</body>
+</html>
