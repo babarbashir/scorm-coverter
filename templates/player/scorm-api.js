@@ -31,6 +31,12 @@
   var startTime = new Date().getTime();
   var commitTimer = null;
   var log = [];
+  // Mirror of what the LMS currently holds, so report() can avoid downgrades.
+  var status12 = '';
+  var completion2004 = '';
+  var success2004 = '';
+  var lastScore = null;
+  var interactionIndex = -1;
 
   function debug(msg) {
     log.push(msg);
@@ -152,9 +158,9 @@
     get reviewMode() { return reviewMode; },
     log: log,
 
-    // Returns the saved state: { location, suspendData, completed }
+    // Returns the saved state: { location, suspendData, completed, success }
     start: function () {
-      var state = { location: '', suspendData: '', completed: false };
+      var state = { location: '', suspendData: '', completed: false, success: 'unknown' };
       if (initialized) return state;
       if (!discover()) { debug('No LMS API found, running standalone'); return state; }
 
@@ -172,20 +178,31 @@
 
       if (version === '1.2') {
         var status = getValue('cmi.core.lesson_status');
+        status12 = status;
         reviewMode = getValue('cmi.core.lesson_mode') === 'review';
-        completed = status === 'completed' || status === 'passed';
-        if (!reviewMode && (status === '' || status === 'not attempted' || status === 'unknown')) {
+        completed = status === 'completed' || status === 'passed' || status === 'failed';
+        if (!reviewMode && (status === '' || status === 'not attempted' || status === 'unknown' || status === 'browsed')) {
           setValue('cmi.core.lesson_status', 'incomplete');
+          status12 = 'incomplete';
         }
         state.location = getValue('cmi.core.lesson_location');
+        state.success = status === 'passed' || status === 'failed' ? status : 'unknown';
+        var s12 = getValue('cmi.core.score.raw');
+        if (s12 !== '' && !isNaN(s12)) lastScore = parseFloat(s12);
       } else {
         var cs = getValue('cmi.completion_status');
+        completion2004 = cs;
+        success2004 = getValue('cmi.success_status');
         reviewMode = getValue('cmi.mode') === 'review';
         completed = cs === 'completed';
         if (!reviewMode && cs !== 'completed' && cs !== 'incomplete') {
           setValue('cmi.completion_status', 'incomplete');
+          completion2004 = 'incomplete';
         }
         state.location = getValue('cmi.location');
+        state.success = success2004 === 'passed' || success2004 === 'failed' ? success2004 : 'unknown';
+        var s04 = getValue('cmi.score.raw');
+        if (s04 !== '' && !isNaN(s04)) lastScore = parseFloat(s04);
       }
       state.suspendData = getValue('cmi.suspend_data');
       state.completed = completed;
@@ -222,27 +239,91 @@
       scheduleCommit();
     },
 
-    complete: function () {
-      // Already complete (possibly "passed" from an earlier attempt): leave the
-      // LMS record untouched rather than risk downgrading it.
-      if (completed || !this.connected || reviewMode) { completed = true; return; }
-      if (cfg.reportScore) {
-        var pre = version === '1.2' ? 'cmi.core.score.' : 'cmi.score.';
-        setValue(pre + 'min', '0');
-        setValue(pre + 'max', '100');
-        setValue(pre + 'raw', '100');
-        if (version === '2004') setValue('cmi.score.scaled', '1');
+    /*
+     * Reports the course outcome.
+     *   completed: all required content done
+     *   success:   'passed' | 'failed' | 'unknown'
+     *   score:     0..100 or null
+     * Never downgrades what the LMS already holds (passed stays passed,
+     * completed stays completed), and commits right away when anything changed.
+     */
+    report: function (o) {
+      if (!this.connected || reviewMode) { if (o.completed) completed = true; return; }
+      var changed = false;
+      var success = o.success === 'passed' || o.success === 'failed' ? o.success : 'unknown';
+
+      if (o.score != null && !isNaN(o.score)) {
+        var raw = Math.max(0, Math.min(100, Math.round(o.score * 100) / 100));
+        if (raw !== lastScore) {
+          var pre = version === '1.2' ? 'cmi.core.score.' : 'cmi.score.';
+          setValue(pre + 'min', '0');
+          setValue(pre + 'max', '100');
+          setValue(pre + 'raw', String(raw));
+          if (version === '2004') setValue('cmi.score.scaled', String(Math.round(raw * 100) / 10000));
+          lastScore = raw;
+          changed = true;
+        }
       }
+
       if (version === '1.2') {
-        setValue('cmi.core.lesson_status', cfg.passOnComplete ? 'passed' : 'completed');
+        var want = 'incomplete';
+        if (success === 'failed') want = 'failed';
+        else if (o.completed && success === 'passed') want = 'passed';
+        else if (o.completed) want = 'completed';
+        // Allowed moves only: never away from passed, never back to incomplete.
+        var rank = { 'incomplete': 0, 'completed': 1, 'failed': 1, 'passed': 2 };
+        var move = want !== status12 && rank[want] >= (rank[status12] || 0) && status12 !== 'passed' &&
+          !(status12 === 'failed' && want === 'completed');
+        if (move) { setValue('cmi.core.lesson_status', want); status12 = want; changed = true; }
+        completed = status12 === 'completed' || status12 === 'passed' || status12 === 'failed';
       } else {
-        setValue('cmi.progress_measure', '1');
-        setValue('cmi.completion_status', 'completed');
-        if (cfg.passOnComplete) setValue('cmi.success_status', 'passed');
+        if (o.completed && completion2004 !== 'completed') {
+          setValue('cmi.progress_measure', '1');
+          setValue('cmi.completion_status', 'completed');
+          completion2004 = 'completed';
+          changed = true;
+        }
+        if (success !== 'unknown' && success !== success2004 && success2004 !== 'passed') {
+          setValue('cmi.success_status', success);
+          success2004 = success;
+          changed = true;
+        }
+        completed = completion2004 === 'completed';
       }
-      completed = true;
-      commitNow();
-      debug('Marked complete');
+      if (changed) { commitNow(); debug('Reported ' + JSON.stringify(o)); }
+    },
+
+    /*
+     * Records one answered question as a SCORM interaction.
+     *   { id, description, response: ['a','c'], correct: ['a','c'], result: true|false }
+     */
+    recordInteraction: function (q) {
+      if (!this.connected || reviewMode) return;
+      if (interactionIndex < 0) {
+        interactionIndex = parseInt(getValue('cmi.interactions._count'), 10) || 0;
+      }
+      var n = 'cmi.interactions.' + interactionIndex + '.';
+      var id = String(q.id).replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 250);
+      var now = new Date();
+      if (!setValue(n + 'id', id)) return;
+      setValue(n + 'type', 'choice');
+      if (version === '1.2') {
+        setValue(n + 'student_response', q.response.join(','));
+        setValue(n + 'correct_responses.0.pattern', q.correct.join(','));
+        setValue(n + 'result', q.result ? 'correct' : 'wrong');
+        setValue(n + 'weighting', '1');
+        setValue(n + 'time', pad(now.getHours(), 2) + ':' + pad(now.getMinutes(), 2) + ':' + pad(now.getSeconds(), 2));
+      } else {
+        if (q.description) setValue(n + 'description', String(q.description).slice(0, 250));
+        setValue(n + 'learner_response', q.response.join('[,]'));
+        setValue(n + 'correct_responses.0.pattern', q.correct.join('[,]'));
+        setValue(n + 'result', q.result ? 'correct' : 'incorrect');
+        setValue(n + 'weighting', '1');
+        setValue(n + 'timestamp', now.getFullYear() + '-' + pad(now.getMonth() + 1, 2) + '-' + pad(now.getDate(), 2) +
+          'T' + pad(now.getHours(), 2) + ':' + pad(now.getMinutes(), 2) + ':' + pad(now.getSeconds(), 2));
+      }
+      interactionIndex++;
+      scheduleCommit();
     },
 
     commit: function () { if (dirty) commitNow(); },

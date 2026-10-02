@@ -3,80 +3,83 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SCORM Converter</title>
+<title>SCORM Course Builder</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header class="top">
   <div class="brand">
     <svg width="26" height="26" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2 3 6.5v11L12 22l9-4.5v-11L12 2Zm0 2.2 6.6 3.3L12 10.8 5.4 7.5 12 4.2ZM5 9.1l6 3v7.6l-6-3V9.1Zm8 10.6v-7.6l6-3v7.6l-6 3Z"/></svg>
-    <span>SCORM Converter</span>
+    <span>SCORM Course Builder</span>
   </div>
-  <p class="tagline">MP4 · PDF · PPTX · DOCX → SCORM 1.2 / 2004</p>
+  <p class="tagline">Turn videos, PDFs, slides and documents into one SCORM course, with quizzes, a pass mark and score reporting.</p>
 </header>
 
 <main class="wrap">
-  <section class="card" id="form-card">
-    <form id="form" novalidate>
-      <label class="drop" id="drop" for="file">
-        <input type="file" id="file" name="file" accept=".mp4,.m4v,.pdf,.pptx,.docx,video/mp4,application/pdf,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden>
-        <div class="drop-empty">
-          <svg width="40" height="40" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M11 16V7.8l-2.6 2.6L7 9l5-5 5 5-1.4 1.4L13 7.8V16h-2Zm-5 4a2 2 0 0 1-2-2v-3h2v3h12v-3h2v3a2 2 0 0 1-2 2H6Z"/></svg>
-          <strong>Drop a file here or click to browse</strong>
-          <span>MP4, PDF, PPTX or DOCX · up to 500 MB</span>
-        </div>
-        <div class="drop-file" hidden>
-          <span class="file-badge" id="file-badge">PDF</span>
-          <span class="file-meta"><strong id="file-name"></strong><span id="file-size"></span></span>
-          <button type="button" class="link" id="file-clear">Change</button>
-        </div>
-      </label>
-      <p class="field-error" id="file-error" role="alert"></p>
-
+  <div id="builder">
+    <section class="card">
+      <h2 class="card-title"><span class="step">1</span> Course</h2>
       <div class="grid">
         <div class="field full">
           <label for="title">Course title</label>
-          <input type="text" id="title" name="title" maxlength="200" placeholder="Shown in the LMS catalogue">
+          <input type="text" id="title" maxlength="200" placeholder="Shown in the LMS catalogue">
         </div>
-
         <div class="field full">
           <span class="label">SCORM version</span>
-          <div class="seg" role="radiogroup" aria-label="SCORM version" id="versions">
+          <div class="seg" role="radiogroup" aria-label="SCORM version">
             <label><input type="radio" name="version" value="1.2" checked><span>SCORM 1.2</span></label>
             <label><input type="radio" name="version" value="2004-3"><span>2004 3rd Ed.</span></label>
             <label><input type="radio" name="version" value="2004-4"><span>2004 4th Ed.</span></label>
           </div>
-          <p class="hint">SCORM 1.2 is the most widely supported. Pick 2004 if your LMS asks for it.</p>
+          <p class="hint">SCORM 1.2 is the most widely supported. Pick 2004 if your LMS asks for it or you want separate completion and pass/fail reporting.</p>
         </div>
+      </div>
+    </section>
 
-        <div class="field full">
-          <span class="label">Mark as complete when</span>
-          <div class="radios">
-            <label class="radio"><input type="radio" name="completion" value="progress" checked>
-              <span>The learner has <span id="progress-verb">viewed</span>
-                <input type="number" id="threshold" name="threshold" min="1" max="100" value="100" aria-label="Completion percentage"> %
-                of the <span id="progress-noun">pages</span></span></label>
-            <label class="radio"><input type="radio" name="completion" value="launch"><span>The learner opens it</span></label>
-          </div>
+    <section class="card">
+      <div class="card-head">
+        <h2 class="card-title"><span class="step">2</span> Content</h2>
+        <span class="muted" id="content-summary"></span>
+      </div>
+      <ol class="items" id="items" aria-label="Course items"></ol>
+      <label class="drop" id="drop" for="files">
+        <input type="file" id="files" multiple accept=".mp4,.m4v,.pdf,.pptx,.docx" hidden>
+        <svg width="32" height="32" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M11 16V7.8l-2.6 2.6L7 9l5-5 5 5-1.4 1.4L13 7.8V16h-2Zm-5 4a2 2 0 0 1-2-2v-3h2v3h12v-3h2v3a2 2 0 0 1-2 2H6Z"/></svg>
+        <strong>Drop files here or click to add</strong>
+        <span>MP4, PDF, PPTX or DOCX · up to 500 MB each · add as many as you need</span>
+      </label>
+      <p class="field-error" id="file-error" role="alert"></p>
+      <div class="add-row">
+        <button type="button" class="btn" id="add-files">+ Add files</button>
+        <button type="button" class="btn" id="add-quiz">+ Add quiz</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2 class="card-title"><span class="step">3</span> Rules &amp; reporting</h2>
+      <div class="field">
+        <span class="label">Navigation</span>
+        <div class="radios">
+          <label class="radio"><input type="radio" name="navigation" value="free" checked><span><b>Free</b>: learners can open any section in any order</span></label>
+          <label class="radio"><input type="radio" name="navigation" value="sequential"><span><b>Sequential</b>: each required section must be completed before the next one unlocks</span></label>
         </div>
-
-        <details class="field full advanced">
-          <summary>Tracking options</summary>
-          <label class="check"><input type="checkbox" name="passOnComplete"> <span>Report <b>passed</b> as well as completed <small>Useful for LMSs that only count "passed" in their reports</small></span></label>
-          <label class="check"><input type="checkbox" name="reportScore"> <span>Report a score of 100% on completion <small>For LMSs that require a score to close the record</small></span></label>
-          <label class="check video-only" hidden><input type="checkbox" name="restrictSeek"> <span>Stop learners skipping ahead <small>They can only seek back to parts they have already watched</small></span></label>
-        </details>
       </div>
-
-      <div class="actions">
-        <button type="submit" class="btn primary" id="submit" disabled>Convert to SCORM</button>
+      <div class="report-box" id="report-box"></div>
+      <div class="field checks">
+        <label class="check quiz-only"><input type="checkbox" id="recordInteractions" checked> <span>Record each answer in the LMS <small>Stored as SCORM interactions, for LMS question reports</small></span></label>
+        <label class="check no-quiz"><input type="checkbox" id="passOnComplete"> <span>Report <b>passed</b> as well as completed <small>Useful for LMSs that only count "passed" in their reports</small></span></label>
+        <label class="check no-quiz"><input type="checkbox" id="reportScore"> <span>Report a score of 100% on completion <small>For LMSs that require a score to close the record</small></span></label>
       </div>
-    </form>
-  </section>
+    </section>
+
+    <div class="build-row">
+      <p class="field-error" id="build-error" role="alert"></p>
+      <button type="button" class="btn primary big" id="build" disabled>Build SCORM package</button>
+    </div>
+  </div>
 
   <section class="card" id="progress-card" hidden>
     <div class="job-head">
-      <span class="file-badge" id="job-badge">PDF</span>
       <div>
         <strong id="job-title"></strong>
         <div class="muted" id="job-sub"></div>
@@ -95,25 +98,82 @@
       <div class="actions">
         <a class="btn primary" id="download" href="#">Download .zip</a>
         <a class="btn" id="preview" href="#" target="_blank" rel="noopener">Test in LMS simulator</a>
-        <button type="button" class="btn ghost" id="again">Convert another file</button>
+        <button type="button" class="btn ghost" id="edit-again">Back to course</button>
+        <button type="button" class="btn ghost" id="start-over">New course</button>
       </div>
       <p class="hint">Upload the .zip as-is to your LMS. Don't unzip it first.</p>
     </div>
     <div class="actions" id="retry-row" hidden>
-      <button type="button" class="btn" id="retry">Start over</button>
+      <button type="button" class="btn" id="retry">Back to course</button>
     </div>
   </section>
-
-  <section class="notes">
-    <h2>What you get</h2>
-    <ul>
-      <li><b>Standard packages.</b> Includes <code>imsmanifest.xml</code> and the official ADL schema files, with a single SCO launching <code>index.html</code>.</li>
-      <li><b>Tracking.</b> Completion, a resume position, session time and progress are all reported to the LMS.</li>
-      <li><b>No external calls.</b> The player, PDF viewer and fonts are all inside the package, so it works on locked-down networks.</li>
-      <li><b>Documents.</b> PPTX and DOCX files are converted to PDF first. Slide animations and embedded audio or video are not carried over.</li>
-    </ul>
-  </section>
 </main>
+
+<!-- Quiz editor -->
+<dialog id="quiz-dialog" aria-labelledby="qd-title">
+  <form method="dialog" class="qd" id="quiz-form" novalidate>
+    <header class="qd-head">
+      <h2 id="qd-title">Edit quiz</h2>
+      <button type="button" class="icon-btn" id="qd-close" aria-label="Close">&times;</button>
+    </header>
+    <div class="qd-body">
+      <div class="grid">
+        <div class="field full">
+          <label for="qd-name">Quiz title</label>
+          <input type="text" id="qd-name" maxlength="200">
+        </div>
+        <div class="field">
+          <label for="qd-pass">Pass mark (%)</label>
+          <input type="number" id="qd-pass" min="0" max="100" value="80">
+        </div>
+        <div class="field">
+          <label for="qd-attempts">Attempts allowed</label>
+          <select id="qd-attempts">
+            <option value="0">Unlimited</option>
+            <option value="1">1</option><option value="2">2</option><option value="3">3</option>
+            <option value="4">4</option><option value="5">5</option><option value="10">10</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="qd-draw">Questions per attempt</label>
+          <input type="number" id="qd-draw" min="0" value="0">
+          <p class="hint">0 = all. A lower number draws a random set from the pool each attempt.</p>
+        </div>
+        <div class="field">
+          <label for="qd-feedback">After submitting, show</label>
+          <select id="qd-feedback">
+            <option value="answers">Score, right/wrong and correct answers</option>
+            <option value="result">Score and right/wrong only</option>
+            <option value="none">Score only</option>
+          </select>
+          <p class="hint">Correct answers are only revealed after passing or using all attempts.</p>
+        </div>
+        <div class="field full inline-checks">
+          <label class="check"><input type="checkbox" id="qd-shuffle-q" checked> <span>Shuffle questions</span></label>
+          <label class="check"><input type="checkbox" id="qd-shuffle-a"> <span>Shuffle answer options</span></label>
+        </div>
+      </div>
+
+      <div class="qd-toolbar">
+        <h3>Questions <span class="muted" id="qd-count"></span></h3>
+        <div class="qd-tools">
+          <label class="btn small" for="qd-csv">Import CSV</label>
+          <input type="file" id="qd-csv" accept=".csv,text/csv" hidden>
+          <a class="btn small ghost" href="quiz-template.csv" download>CSV template</a>
+          <button type="button" class="btn small ghost" id="qd-export">Export CSV</button>
+        </div>
+      </div>
+      <p class="field-error" id="qd-csv-msg" role="alert"></p>
+      <ol class="questions" id="qd-questions"></ol>
+      <button type="button" class="btn" id="qd-add">+ Add question</button>
+    </div>
+    <footer class="qd-foot">
+      <p class="field-error" id="qd-error" role="alert"></p>
+      <button type="button" class="btn ghost" id="qd-cancel">Cancel</button>
+      <button type="button" class="btn primary" id="qd-save">Save quiz</button>
+    </footer>
+  </form>
+</dialog>
 
 <script src="app.js"></script>
 </body>

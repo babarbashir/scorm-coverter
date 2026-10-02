@@ -1,5 +1,7 @@
 /*
- * Content player for converted SCORM packages (PDF and video).
+ * Course shell: menu, navigation rules, shared completion and scoring.
+ * Viewers (viewers.js, quiz.js) render one item at a time and report
+ * progress back through the ctx object they are given.
  * ES5 on purpose; see scorm-api.js.
  */
 (function (window, document) {
@@ -7,364 +9,290 @@
 
   var cfg = window.SCORM_CONFIG;
   var scorm = window.ScormRuntime;
+  var U = window.PlayerUtil;
+  var items = cfg.items;
+  var single = items.length === 1;
+
+  var saved = scorm.start();
+  var current = -1;
+  var viewer = null;
+  var lastOutcome = '';
+
+  // -------------------------------------------------------------------
+  // Saved state
+  //   suspend_data: "v2|" + one entry per item, ";"-separated
+  //     file: done,hexbits,extra      quiz: done,attempts,bestPct,passed
+  //   location: "<itemIndex>:<position>"
+  // Finished file items drop their bitmaps to keep under the 4000 char cap.
+  // -------------------------------------------------------------------
+  var states = [];
+  (function restore() {
+    var parts = String(saved.suspendData || '').split('|');
+    var entries = parts[0] === 'v2' ? (parts[1] || '').split(';') : [];
+    for (var i = 0; i < items.length; i++) {
+      var f = (entries[i] || '').split(',');
+      if (items[i].kind === 'quiz') {
+        states.push({ done: f[0] === '1', attempts: parseInt(f[1], 10) || 0, best: parseFloat(f[2]) || 0, passed: f[3] === '1', ratio: 0, pos: '' });
+      } else {
+        states.push({ done: f[0] === '1', bits: f[1] || '', extra: f[2] || '', ratio: f[0] === '1' ? 1 : 0, pos: '' });
+      }
+    }
+  })();
+
+  function serialize() {
+    var out = [];
+    for (var i = 0; i < items.length; i++) {
+      var s = states[i];
+      if (items[i].kind === 'quiz') out.push([s.done ? 1 : 0, s.attempts, Math.round(s.best * 100) / 100, s.passed ? 1 : 0].join(','));
+      else out.push(s.done ? '1' : ['0', s.bits, s.extra].join(','));
+    }
+    return 'v2|' + out.join(';');
+  }
+
+  var savedLoc = String(saved.location || '').split(':');
+  var resumeIndex = parseInt(savedLoc[0], 10);
+  if (!(resumeIndex >= 0 && resumeIndex < items.length)) resumeIndex = -1;
+  if (resumeIndex >= 0) states[resumeIndex].pos = savedLoc.slice(1).join(':');
+
+  // -------------------------------------------------------------------
+  // Outcome
+  // -------------------------------------------------------------------
+  function requiredQuizzes() {
+    var q = [];
+    for (var i = 0; i < items.length; i++) if (items[i].kind === 'quiz' && items[i].required) q.push(i);
+    return q;
+  }
+
+  function outcome() {
+    var contentDone = true;
+    for (var i = 0; i < items.length; i++) if (items[i].required && !states[i].done) contentDone = false;
+
+    var quizzes = requiredQuizzes();
+    var success = 'unknown';
+    var score = null;
+    if (quizzes.length) {
+      var allPassed = true, anyFailedFinal = false, attempted = false, got = 0, max = 0;
+      for (var k = 0; k < quizzes.length; k++) {
+        var s = states[quizzes[k]], qz = items[quizzes[k]].quiz;
+        var weight = qz.drawCount || qz.questions.length;
+        if (!s.passed) allPassed = false;
+        if (!s.passed && s.done) anyFailedFinal = true;
+        if (s.attempts) attempted = true;
+        got += (s.best / 100) * weight;
+        max += weight;
+      }
+      if (allPassed) success = 'passed';
+      else if (anyFailedFinal) success = 'failed';
+      if (attempted) score = max ? (got / max) * 100 : 0;
+    } else if (contentDone) {
+      if (cfg.passOnComplete) success = 'passed';
+      if (cfg.reportScore) score = 100;
+    }
+    return { completed: contentDone, success: success, score: score };
+  }
+
+  function overallRatio() {
+    var req = 0, sum = 0;
+    for (var i = 0; i < items.length; i++) {
+      if (!items[i].required) continue;
+      req++;
+      sum += states[i].done ? 1 : Math.min(0.99, states[i].ratio || 0);
+    }
+    return req ? sum / req : 1;
+  }
+
+  // -------------------------------------------------------------------
+  // Layout
+  // -------------------------------------------------------------------
+  var app = document.getElementById('app');
+  var menu = document.getElementById('menu');
+  var menuList = document.getElementById('menu-list');
   var stage = document.getElementById('stage');
+  var itemTitle = document.getElementById('item-title');
+  var prevItemBtn = document.getElementById('prev-item');
+  var nextItemBtn = document.getElementById('next-item');
+  var menuToggle = document.getElementById('menu-toggle');
   var meterFill = document.getElementById('meter-fill');
   var meter = meterFill.parentNode;
   var statusText = document.getElementById('status-text');
-  var toastEl = document.getElementById('toast');
-  var toastTimer = null;
 
-  var saved = scorm.start();
+  if (single) app.className += ' single';
 
-  // -------------------------------------------------------------------
-  // Utilities
-  // -------------------------------------------------------------------
-  function el(tag, attrs, html) {
-    var e = document.createElement(tag);
-    if (attrs) for (var k in attrs) if (attrs.hasOwnProperty(k)) e.setAttribute(k, attrs[k]);
-    if (html != null) e.innerHTML = html;
-    return e;
+  function isLocked(i) {
+    if (cfg.navigation !== 'sequential') return false;
+    for (var j = 0; j < i; j++) if (items[j].required && !states[j].done) return true;
+    return false;
   }
 
-  function toast(msg) {
-    toastEl.textContent = msg;
-    toastEl.className = 'show';
-    clearTimeout(toastTimer);
-    toastTimer = setTimeout(function () { toastEl.className = ''; }, 2600);
-  }
-
-  function showMessage(title, body, spinner) {
-    stage.innerHTML = '';
-    var m = el('div', { 'class': 'message' });
-    if (spinner) m.appendChild(el('div', { 'class': 'spinner' }));
-    m.appendChild(el('h2', null, title));
-    if (body) m.appendChild(el('p', null, body));
-    stage.appendChild(m);
-  }
-
-  function fmtTime(sec) {
-    sec = Math.max(0, Math.floor(sec));
-    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-    return (h ? h + ':' + (m < 10 ? '0' : '') : '') + m + ':' + (s < 10 ? '0' : '') + s;
-  }
-
-  // Compact bitset, serialised as hex so suspend_data stays small and uses
-  // only characters every LMS stores safely.
-  function Bits(n) {
-    this.n = n;
-    this.a = [];
-    for (var i = 0; i < n; i++) this.a.push(0);
-  }
-  Bits.prototype.set = function (i) { if (i >= 0 && i < this.n && !this.a[i]) { this.a[i] = 1; return true; } return false; };
-  Bits.prototype.count = function () { var c = 0; for (var i = 0; i < this.n; i++) c += this.a[i]; return c; };
-  Bits.prototype.toHex = function () {
-    var out = '';
-    for (var i = 0; i < this.n; i += 4) {
-      var v = 0;
-      for (var j = 0; j < 4; j++) if (this.a[i + j]) v |= (8 >> j);
-      out += v.toString(16);
-    }
-    return out;
-  };
-  Bits.prototype.fromHex = function (hex) {
-    for (var i = 0; i < hex.length; i++) {
-      var v = parseInt(hex.charAt(i), 16);
-      if (isNaN(v)) return;
-      for (var j = 0; j < 4; j++) if (v & (8 >> j)) this.set(i * 4 + j);
-    }
+  var ICONS = {
+    pdf: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 2h8l6 6v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Zm7 1.5V9h5.5L13 3.5ZM8 13v2h8v-2H8Zm0 4v2h5v-2H8Z"/></svg>',
+    video: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 5h11a2 2 0 0 1 2 2v2.5l4-3v11l-4-3V17a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Z"/></svg>',
+    quiz: '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a10 10 0 1 1 0 20 10 10 0 0 1 0-20Zm-1 14v2h2v-2h-2Zm1-10a4 4 0 0 0-4 4h2a2 2 0 1 1 3 1.7c-1.2.7-2 1.6-2 3.3h2c0-1 .4-1.4 1.1-1.9A4 4 0 0 0 12 6Z"/></svg>',
   };
 
-  // suspend_data format: "v1|<hexbits>|<extra>"
-  function parseSuspend(s) {
-    var parts = String(s || '').split('|');
-    if (parts[0] !== 'v1') return { bits: '', extra: '' };
-    return { bits: parts[1] || '', extra: parts[2] || '' };
+  function statusLabel(i) {
+    var s = states[i], it = items[i];
+    if (isLocked(i)) return { cls: 'locked', text: 'Locked' };
+    if (it.kind === 'quiz') {
+      if (s.passed) return { cls: 'done', text: 'Passed · ' + Math.round(s.best) + '%' };
+      if (s.done) return { cls: 'failed', text: 'Not passed · ' + Math.round(s.best) + '%' };
+      if (s.attempts) return { cls: 'progress', text: 'Best ' + Math.round(s.best) + '%' };
+      return { cls: 'todo', text: it.quiz.questions.length > 0 ? (it.quiz.drawCount || it.quiz.questions.length) + ' questions' : '' };
+    }
+    if (s.done) return { cls: 'done', text: 'Completed' };
+    if (s.ratio > 0) return { cls: 'progress', text: Math.round(s.ratio * 100) + '%' };
+    return { cls: 'todo', text: 'Not started' };
   }
 
-  // -------------------------------------------------------------------
-  // Progress + completion
-  // -------------------------------------------------------------------
-  var isComplete = !!saved.completed;
-  var threshold = cfg.completion.mode === 'launch' ? 0 : cfg.completion.threshold / 100;
+  function renderMenu() {
+    menuList.innerHTML = '';
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i], st = statusLabel(i);
+      var li = document.createElement('li');
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'menu-item st-' + st.cls + (i === current ? ' active' : '') + (it.parent ? ' child' : '');
+      b.disabled = st.cls === 'locked';
+      if (i === current) b.setAttribute('aria-current', 'page');
+      b.innerHTML = '<span class="mi-icon ' + it.kind + '">' + ICONS[it.kind] + '</span>' +
+        '<span class="mi-text"><span class="mi-title"></span><span class="mi-status"></span></span>' +
+        '<span class="mi-check" aria-hidden="true"></span>';
+      b.querySelector('.mi-title').textContent = (i + 1) + '. ' + it.title + (it.required ? '' : ' (optional)');
+      b.querySelector('.mi-status').textContent = st.text;
+      b.setAttribute('aria-label', (i + 1) + '. ' + it.title + ', ' + st.text);
+      b.onclick = (function (idx) { return function () { open(idx); closeMenuOnMobile(); }; })(i);
+      li.appendChild(b);
+      menuList.appendChild(li);
+    }
+    prevItemBtn.disabled = current <= 0;
+    nextItemBtn.disabled = current >= items.length - 1 || isLocked(current + 1);
+    nextItemBtn.title = isLocked(current + 1) ? 'Complete this section to continue' : '';
+  }
 
-  function renderProgress(ratio) {
-    var pct = isComplete ? 100 : Math.round(ratio * 100);
+  function renderProgress() {
+    var o = outcome();
+    var pct = o.completed ? 100 : Math.round(overallRatio() * 100);
     meterFill.style.width = pct + '%';
     meter.setAttribute('aria-valuenow', String(pct));
-    statusText.textContent = isComplete ? 'Completed' : pct + '% viewed';
-    if (isComplete) document.body.className += document.body.className.indexOf('is-complete') < 0 ? ' is-complete' : '';
+    var text;
+    if (o.success === 'passed' && o.completed) text = 'Passed';
+    else if (o.success === 'failed') text = 'Not passed';
+    else if (o.completed) text = 'Completed';
+    else text = pct + '% complete';
+    statusText.textContent = text;
+    app.className = app.className.replace(/\s?is-(complete|failed)/g, '') +
+      (o.success === 'failed' ? ' is-failed' : (o.completed ? ' is-complete' : ''));
   }
 
-  function markComplete() {
-    if (isComplete && scorm.completed) return;
-    var wasComplete = isComplete;
-    isComplete = true;
-    scorm.complete();
-    if (!wasComplete) toast('Completed. Your progress has been recorded.');
-  }
-
-  function updateProgress(ratio, location, suspend) {
-    // Save first so the immediate commit on completion includes this state.
-    scorm.save(location, suspend, ratio);
-    if (!isComplete && ratio + 1e-9 >= threshold) markComplete();
-    renderProgress(ratio);
-  }
-
-  if (cfg.completion.mode === 'launch') markComplete();
-
-  if (!scorm.connected) {
-    // Useful when opening index.html directly for a quick check.
-    setTimeout(function () { toast('Preview mode: no LMS connection, progress will not be saved.'); }, 600);
+  function persist(force) {
+    var loc = current >= 0 ? current + ':' + (states[current].pos || '') : '';
+    scorm.save(loc, serialize(), overallRatio());
+    var o = outcome();
+    var key = o.completed + '|' + o.success + '|' + (o.score == null ? '' : Math.round(o.score * 100));
+    if (key !== lastOutcome) {
+      var was = lastOutcome;
+      lastOutcome = key;
+      scorm.report(o);
+      if (was && o.completed && was.indexOf('true|') !== 0) {
+        U.toast(o.success === 'failed' ? 'Course finished. Your result has been recorded.' : 'Course complete. Your progress has been recorded.');
+      }
+    }
+    if (force) scorm.commit();
+    renderProgress();
   }
 
   // -------------------------------------------------------------------
-  // PDF player
+  // Navigation
   // -------------------------------------------------------------------
-  function initPdf() {
-    var lib = window.pdfjsLib;
-    if (!lib) { showMessage('Unable to load the document viewer', '<a href="' + cfg.src + '" target="_blank" rel="noopener">Open the document</a>'); return; }
-    lib.GlobalWorkerOptions.workerSrc = 'player/pdfjs/pdf.worker.min.js';
-
-    showMessage('Loading document…', null, true);
-
-    var pdf = null, pageNum = 1, total = 0, viewed = null;
-    var zoom = 1, renderTask = null, pendingPage = null;
-    var restored = parseSuspend(saved.suspendData);
-
-    var toolbar = el('div', { 'class': 'toolbar', role: 'toolbar', 'aria-label': 'Document controls' });
-    var prevBtn = el('button', { 'class': 'btn', type: 'button', title: 'Previous page (←)', 'aria-label': 'Previous page' }, '&#8249; Prev');
-    var nextBtn = el('button', { 'class': 'btn primary', type: 'button', title: 'Next page (→)', 'aria-label': 'Next page' }, 'Next &#8250;');
-    var pageInfo = el('div', { 'class': 'pageinfo' });
-    var pageInput = el('input', { type: 'text', inputmode: 'numeric', 'aria-label': 'Page number' });
-    var pageCount = el('span');
-    pageInfo.appendChild(pageInput); pageInfo.appendChild(pageCount);
-    var zoomOut = el('button', { 'class': 'btn zoom', type: 'button', title: 'Zoom out', 'aria-label': 'Zoom out' }, '&minus;');
-    var zoomFit = el('button', { 'class': 'btn zoom', type: 'button', title: 'Fit to window', 'aria-label': 'Fit to window' }, 'Fit');
-    var zoomIn = el('button', { 'class': 'btn zoom', type: 'button', title: 'Zoom in', 'aria-label': 'Zoom in' }, '+');
-    var fsBtn = el('button', { 'class': 'btn', type: 'button', title: 'Full screen', 'aria-label': 'Full screen' }, '&#x26F6;');
-
-    toolbar.appendChild(prevBtn); toolbar.appendChild(pageInfo); toolbar.appendChild(nextBtn);
-    toolbar.appendChild(el('span', { 'class': 'sep' }));
-    toolbar.appendChild(zoomOut); toolbar.appendChild(zoomFit); toolbar.appendChild(zoomIn);
-    var fsTarget = document.documentElement;
-    var canFs = fsTarget.requestFullscreen || fsTarget.webkitRequestFullscreen;
-    if (canFs) toolbar.appendChild(fsBtn);
-
-    var viewport = el('div', { 'class': 'viewport', tabindex: '0' });
-    var canvas = el('canvas', { 'class': 'page-canvas', role: 'img' });
-    viewport.appendChild(canvas);
-
-    function saveState() {
-      updateProgress(viewed.count() / total, String(pageNum), 'v1|' + viewed.toHex() + '|');
-    }
-
-    var busy = false;
-    function afterRender() {
-      busy = false;
-      renderTask = null;
-      if (pendingPage !== null) { var p = pendingPage; pendingPage = null; render(p); }
-    }
-
-    function render(num) {
-      if (busy) { pendingPage = num; if (renderTask) renderTask.cancel(); return; }
-      busy = true;
-      pdf.getPage(num).then(function (page) {
-        var base = page.getViewport({ scale: 1 });
-        var availW = Math.max(100, viewport.clientWidth - 32);
-        var availH = Math.max(100, viewport.clientHeight - 32);
-        // Landscape pages (slides) fit whole; portrait pages fit width.
-        var landscape = base.width > base.height;
-        var fit = landscape ? Math.min(availW / base.width, availH / base.height) : availW / base.width;
-        viewport.className = 'viewport' + (landscape && zoom <= 1 ? ' fit-page' : '');
-        var cssScale = fit * zoom;
-        var dpr = window.devicePixelRatio || 1;
-        var vp = page.getViewport({ scale: cssScale * dpr });
-        // Keep under mobile Safari's canvas limit (~16.7 MP).
-        var maxPx = 16000000;
-        var shrink = Math.min(1, Math.sqrt(maxPx / (vp.width * vp.height)));
-        if (shrink < 1) vp = page.getViewport({ scale: cssScale * dpr * shrink });
-
-        canvas.width = Math.floor(vp.width);
-        canvas.height = Math.floor(vp.height);
-        canvas.style.width = Math.floor(base.width * cssScale) + 'px';
-        canvas.style.height = Math.floor(base.height * cssScale) + 'px';
-        canvas.setAttribute('aria-label', 'Page ' + num + ' of ' + total);
-
-        renderTask = page.render({ canvasContext: canvas.getContext('2d'), viewport: vp });
-        return renderTask.promise.then(function () {
-          // Only count the page if the learner is still on it.
-          if (pendingPage === null && num === pageNum) {
-            viewed.set(num - 1);
-            saveState();
-          }
-          afterRender();
-        }, afterRender);
-      }).then(null, afterRender);
-    }
-
-    function go(num) {
-      num = Math.max(1, Math.min(total, num | 0));
-      pageNum = num;
-      pageInput.value = String(num);
-      prevBtn.disabled = num <= 1;
-      nextBtn.disabled = num >= total;
-      viewport.scrollTop = 0;
-      render(num);
-    }
-
-    prevBtn.onclick = function () { go(pageNum - 1); };
-    nextBtn.onclick = function () { go(pageNum + 1); };
-    pageInput.onchange = function () { go(parseInt(pageInput.value, 10) || pageNum); };
-    pageInput.onkeydown = function (e) { if (e.keyCode === 13) pageInput.onchange(); };
-    zoomIn.onclick = function () { zoom = Math.min(4, zoom * 1.25); render(pageNum); };
-    zoomOut.onclick = function () { zoom = Math.max(0.5, zoom / 1.25); render(pageNum); };
-    zoomFit.onclick = function () { zoom = 1; render(pageNum); };
-    fsBtn.onclick = function () {
-      var d = document;
-      if (d.fullscreenElement || d.webkitFullscreenElement) (d.exitFullscreen || d.webkitExitFullscreen).call(d);
-      else (fsTarget.requestFullscreen || fsTarget.webkitRequestFullscreen).call(fsTarget);
+  function makeCtx(i) {
+    var it = items[i], s = states[i];
+    return {
+      item: it,
+      state: s,
+      config: cfg,
+      // File viewers: ratio 0..1, pos (resume position), bits (hex), extra
+      update: function (u) {
+        if (u.pos != null) s.pos = String(u.pos);
+        if (u.bits != null) s.bits = u.bits;
+        if (u.extra != null) s.extra = String(u.extra);
+        if (u.ratio != null) s.ratio = Math.max(s.ratio || 0, u.ratio);
+        var justDone = false;
+        if (!s.done && it.kind !== 'quiz' && s.ratio + 1e-9 >= it.threshold / 100) { s.done = true; justDone = true; }
+        persist(false);
+        if (justDone) sectionDone(i);
+        else renderMenu();
+      },
+      // Quiz: called after each submitted attempt.
+      quizResult: function (pct, passed) {
+        s.attempts++;
+        s.best = Math.max(s.best, pct);
+        if (passed) s.passed = true;
+        var max = it.quiz.maxAttempts;
+        var wasDone = s.done;
+        s.done = s.passed || (max > 0 && s.attempts >= max);
+        s.ratio = s.done ? 1 : s.ratio;
+        persist(true);
+        renderMenu();
+        if (s.done && !wasDone && s.passed) sectionDone(i, true);
+      },
+      next: function () { if (i < items.length - 1 && !isLocked(i + 1)) open(i + 1); },
+      hasNext: function () { return i < items.length - 1 && !isLocked(i + 1); },
+      // Label for the "go on" button: points at this section's own quiz if it has one.
+      nextLabel: function () {
+        var n = items[i + 1];
+        return n && n.parent === it.id ? 'Take the quiz' : 'Continue';
+      },
     };
-
-    document.addEventListener('keydown', function (e) {
-      if (e.target === pageInput) return;
-      if (e.keyCode === 37 || e.keyCode === 33) { go(pageNum - 1); e.preventDefault(); }
-      else if (e.keyCode === 39 || e.keyCode === 34) { go(pageNum + 1); e.preventDefault(); }
-      else if (e.keyCode === 36) { go(1); e.preventDefault(); }
-      else if (e.keyCode === 35) { go(total); e.preventDefault(); }
-    });
-
-    // Swipe between pages on touch devices when not zoomed in.
-    var touchX = null, touchY = null;
-    viewport.addEventListener('touchstart', function (e) {
-      if (e.touches.length === 1) { touchX = e.touches[0].clientX; touchY = e.touches[0].clientY; } else touchX = null;
-    }, { passive: true });
-    viewport.addEventListener('touchend', function (e) {
-      if (touchX === null || zoom > 1) return;
-      var dx = e.changedTouches[0].clientX - touchX, dy = e.changedTouches[0].clientY - touchY;
-      if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) go(pageNum + (dx < 0 ? 1 : -1));
-      touchX = null;
-    }, { passive: true });
-
-    var resizeTimer = null;
-    window.addEventListener('resize', function () {
-      clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(function () { if (pdf) render(pageNum); }, 150);
-    });
-
-    lib.getDocument({
-      url: cfg.src,
-      cMapUrl: 'player/pdfjs/cmaps/',
-      cMapPacked: true,
-      standardFontDataUrl: 'player/pdfjs/standard_fonts/',
-      isEvalSupported: false,
-    }).promise.then(function (doc) {
-      pdf = doc;
-      total = doc.numPages;
-      viewed = new Bits(total);
-      viewed.fromHex(restored.bits);
-      pageCount.textContent = '/ ' + total;
-      stage.innerHTML = '';
-      stage.appendChild(toolbar);
-      stage.appendChild(viewport);
-      var start = parseInt(saved.location, 10);
-      if (start > 1 && start <= total) {
-        go(start);
-        toast('Resumed at page ' + start);
-      } else go(1);
-      viewport.focus();
-    }, function (err) {
-      showMessage('This document could not be displayed',
-        (err && err.name === 'PasswordException' ? 'The PDF is password protected.' : 'Your browser could not open the document.') +
-        ' <br><a href="' + cfg.src + '" target="_blank" rel="noopener">Open the document directly</a>');
-    });
   }
 
-  // -------------------------------------------------------------------
-  // Video player
-  // -------------------------------------------------------------------
-  function initVideo() {
-    var wrap = el('div', { 'class': 'video-wrap' });
-    var video = el('video', { controls: '', playsinline: '', 'webkit-playsinline': '', preload: 'metadata', controlsList: 'nodownload' });
-    video.setAttribute('aria-label', cfg.title);
-    if (cfg.poster) video.setAttribute('poster', cfg.poster);
-    video.src = cfg.src;
-    wrap.appendChild(video);
+  function sectionDone(i, quiet) {
+    renderMenu();
+    if (single || quiet) return;
+    var nextIdx = i + 1;
+    if (nextIdx < items.length) U.toast('Section complete. You can continue to "' + items[nextIdx].title + '".');
+  }
+
+  function open(i) {
+    if (i < 0 || i >= items.length || isLocked(i)) return;
+    if (viewer && viewer.destroy) viewer.destroy();
+    viewer = null;
+    current = i;
+    itemTitle.textContent = single ? '' : items[i].title;
     stage.innerHTML = '';
-    stage.appendChild(wrap);
-
-    var restored = parseSuspend(saved.suspendData);
-    var buckets = null, bucketSize = 1, lastTime = 0, maxWatched = parseFloat(restored.extra) || 0;
-    var lastSave = 0, seekingGuard = false;
-
-    function watchedRatio() { return buckets ? buckets.count() / buckets.n : 0; }
-
-    function mark(from, to) {
-      if (!buckets) return;
-      var a = Math.floor(from / bucketSize), b = Math.floor(to / bucketSize);
-      for (var i = a; i <= b; i++) buckets.set(i);
-    }
-
-    function save(force) {
-      if (!buckets) return;
-      var now = new Date().getTime();
-      var reachedThreshold = !isComplete && watchedRatio() + 1e-9 >= threshold;
-      if (!force && !reachedThreshold && now - lastSave < 5000) { renderProgress(watchedRatio()); return; }
-      lastSave = now;
-      updateProgress(watchedRatio(), String(Math.floor(video.currentTime)), 'v1|' + buckets.toHex() + '|' + Math.floor(maxWatched));
-    }
-
-    video.addEventListener('loadedmetadata', function () {
-      var d = video.duration;
-      if (!d || !isFinite(d)) return;
-      // At most ~8000 buckets keeps suspend_data under 2000 characters.
-      bucketSize = Math.max(1, Math.ceil(d / 8000));
-      buckets = new Bits(Math.max(1, Math.ceil(d / bucketSize)));
-      buckets.fromHex(restored.bits);
-      var resumeAt = parseFloat(saved.location);
-      if (resumeAt > 5 && resumeAt < d - 5) {
-        video.currentTime = resumeAt;
-        lastTime = resumeAt;
-        toast('Resumed at ' + fmtTime(resumeAt));
-      }
-      renderProgress(watchedRatio());
-    });
-
-    video.addEventListener('timeupdate', function () {
-      var t = video.currentTime;
-      if (seekingGuard) return;
-      // Only count continuous playback (not jumps from seeking).
-      if (!video.seeking && t >= lastTime && t - lastTime < 3 * Math.max(1, video.playbackRate || 1)) {
-        mark(lastTime, t);
-        if (t > maxWatched) maxWatched = t;
-      }
-      lastTime = t;
-      save(false);
-    });
-
-    video.addEventListener('seeking', function () {
-      if (cfg.restrictSeek && !isComplete && video.currentTime > maxWatched + 2) {
-        seekingGuard = true;
-        video.currentTime = maxWatched;
-        toast('Skipping ahead is disabled until you have watched the video.');
-        setTimeout(function () { seekingGuard = false; }, 300);
-      }
-      lastTime = video.currentTime;
-    });
-
-    video.addEventListener('pause', function () { save(true); scorm.commit(); });
-    video.addEventListener('ended', function () {
-      if (buckets) { mark(lastTime, video.duration); buckets.set(buckets.n - 1); }
-      maxWatched = video.duration;
-      save(true);
-    });
-
-    video.addEventListener('error', function () {
-      showMessage('This video could not be played', 'Your browser was unable to play the video. <a href="' + cfg.src + '" target="_blank" rel="noopener">Try opening it directly</a>.');
-    });
-
-    renderProgress(0);
+    stage.scrollTop = 0;
+    var Viewer = window.Viewers[items[i].kind];
+    viewer = Viewer(stage, makeCtx(i));
+    renderMenu();
+    persist(false);
   }
 
-  renderProgress(0);
-  if (cfg.type === 'pdf') initPdf(); else initVideo();
+  prevItemBtn.onclick = function () { open(current - 1); };
+  nextItemBtn.onclick = function () { open(current + 1); };
+
+  function closeMenuOnMobile() {
+    if (window.innerWidth < 760) app.className = app.className.replace(/\s?menu-open/g, '');
+  }
+  menuToggle.onclick = function () {
+    if (/menu-open/.test(app.className)) app.className = app.className.replace(/\s?menu-open/g, '');
+    else app.className += ' menu-open';
+    menuToggle.setAttribute('aria-expanded', /menu-open/.test(app.className) ? 'true' : 'false');
+  };
+  if (window.innerWidth >= 760 && !single) { app.className += ' menu-open'; menuToggle.setAttribute('aria-expanded', 'true'); }
+
+  // -------------------------------------------------------------------
+  // Boot
+  // -------------------------------------------------------------------
+  // The first persist() reports the restored outcome; report() only writes
+  // values that differ from what the LMS already holds.
+  if (!scorm.connected) {
+    setTimeout(function () { U.toast('Preview mode: no LMS connection, progress will not be saved.'); }, 600);
+  }
+
+  var first = resumeIndex;
+  if (first < 0 || isLocked(first)) {
+    first = 0;
+    for (var k = 0; k < items.length; k++) { if (!states[k].done && !isLocked(k)) { first = k; break; } }
+  }
+  open(first);
+  if (resumeIndex > 0 && first === resumeIndex) U.toast('Welcome back. Picking up at "' + items[first].title + '".');
 })(window, document);

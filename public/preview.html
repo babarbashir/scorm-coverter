@@ -24,6 +24,7 @@
   td { padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: top; word-break: break-all; }
   td:first-child { color: var(--muted); width: 48%; font-family: ui-monospace, Menlo, monospace; }
   td.good { color: var(--ok); font-weight: 600; }
+  td.bad { color: var(--err); font-weight: 600; }
   #log { flex: 1; overflow: auto; margin: 0 14px 14px; padding: 8px; background: var(--code); border-radius: 6px; font: 11px/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
   #log .err { color: var(--err); }
   @media (max-width: 800px) { .main { flex-direction: column; } aside { width: auto; height: 45%; border-left: 0; border-top: 1px solid var(--border); } }
@@ -89,8 +90,57 @@
     'cmi.suspend_data': { max: 64000 }, 'cmi.launch_data': { ro: true },
   };
 
+  // Interaction fields, keyed by the part after "cmi.interactions.N.".
+  var I12 = {
+    'id': { wo: true, re: /^[^\s]{1,255}$/ },
+    'type': { wo: true, vocab: ['true-false', 'choice', 'fill-in', 'matching', 'performance', 'sequencing', 'likert', 'numeric'] },
+    'student_response': { wo: true, max: 255 },
+    'correct_responses.N.pattern': { wo: true, max: 255 },
+    'result': { wo: true, vocab: ['correct', 'wrong', 'unanticipated', 'neutral'], orNum: true },
+    'weighting': { wo: true, num: [-1e9, 1e9] },
+    'time': { wo: true, re: /^\d{2}:\d{2}:\d{2}(\.\d{1,2})?$/ },
+    'latency': { wo: true, re: /^\d{2,4}:\d{2}:\d{2}(\.\d{1,2})?$/ },
+  };
+  var I2004 = {
+    'id': { max: 4000 },
+    'type': { vocab: ['true-false', 'choice', 'fill-in', 'long-fill-in', 'matching', 'performance', 'sequencing', 'likert', 'numeric', 'other'] },
+    'description': { max: 250 },
+    'learner_response': { max: 4000 },
+    'correct_responses.N.pattern': { max: 4000 },
+    'result': { vocab: ['correct', 'incorrect', 'unanticipated', 'neutral'], orNum: true },
+    'weighting': { num: [-1e9, 1e9] },
+    'timestamp': { re: /^\d{4}(-\d{2}(-\d{2}(T\d{2}(:\d{2}(:\d{2}(\.\d{1,2})?)?)?)?)?)?$/ },
+    'latency': { re: /^P/ },
+  };
+
+  function interactionCount() {
+    var n = 0;
+    while (store['cmi.interactions.' + n + '.id'] != null || (session && session.pending['cmi.interactions.' + n + '.id'] != null)) n++;
+    return n;
+  }
+
   function makeApi(v) {
     var model = v === '1.2' ? M12 : M2004;
+    var imodel = v === '1.2' ? I12 : I2004;
+
+    // Resolves a key to its rule; interactions are validated per field and
+    // must be created in order, with id first (as real LMSs enforce).
+    function ruleFor(k, forSet) {
+      if (k === 'cmi.interactions._count') return { ro: true, count: true };
+      var m = /^cmi\.interactions\.(\d+)\.(.+)$/.exec(k);
+      if (!m) return model[k] ? { rule: model[k] } : null;
+      var n = parseInt(m[1], 10);
+      var field = m[2].replace(/^correct_responses\.\d+\.pattern$/, 'correct_responses.N.pattern');
+      var rule = imodel[field];
+      if (!rule) return null;
+      if (forSet) {
+        var count = interactionCount();
+        if (n > count) return { error: v === '1.2' ? '201' : '351', why: 'index ' + n + ' skips ahead (count is ' + count + ')' };
+        var hasId = store['cmi.interactions.' + n + '.id'] != null || session.pending['cmi.interactions.' + n + '.id'] != null;
+        if (field !== 'id' && !hasId) return { error: v === '1.2' ? '201' : '408', why: 'id must be set first' };
+      }
+      return { rule: rule };
+    }
     var err = '0';
     var errText = { '0': 'No error', '101': 'General exception', '103': 'Already initialized', '104': 'Content instance terminated', '112': 'Termination before initialization', '122': 'Retrieve data before initialization', '132': 'Store data before initialization', '142': 'Commit before initialization', '201': 'Invalid argument', '301': 'Not initialized', '351': 'Incorrect data type', '401': 'Not implemented', '403': 'Element not initialized', '404': 'Element is read only', '405': 'Element is write only', '406': 'Type mismatch', '407': 'Value out of range' };
 
@@ -103,8 +153,10 @@
     }
     function get(name, k) {
       if (session.state !== 'running') return (fail(v === '1.2' ? '301' : '122', name + '(' + k + ')'), '');
-      var rule = model[k];
-      if (!rule) { log(name + '("' + k + '") → "" (unsupported)'); err = '401'; return ''; }
+      var r = ruleFor(k, false);
+      if (!r) { log(name + '("' + k + '") → "" (unsupported)'); err = '401'; return ''; }
+      if (r.count) { err = '0'; var c = String(interactionCount()); log(name + '("' + k + '") → "' + c + '"'); return c; }
+      var rule = r.rule;
       if (rule.wo) return (fail(v === '1.2' ? '404' : '405', name + '(' + k + ')'), '');
       err = '0';
       var val = store[k] != null ? store[k] : '';
@@ -115,10 +167,13 @@
       val = String(val);
       var what = name + '("' + k + '", "' + (val.length > 60 ? val.slice(0, 60) + '…' : val) + '")';
       if (session.state !== 'running') return fail(v === '1.2' ? '301' : '132', what);
-      var rule = model[k];
-      if (!rule) return fail(v === '1.2' ? '401' : '401', what);
+      var r = ruleFor(k, true);
+      if (!r) return fail(v === '1.2' ? '401' : '401', what);
+      if (r.error) return fail(r.error, what + ' (' + r.why + ')');
+      if (r.ro) return fail(v === '1.2' ? '403' : '404', what);
+      var rule = r.rule;
       if (rule.ro) return fail(v === '1.2' ? '403' : '404', what);
-      if (rule.vocab && rule.vocab.indexOf(val) < 0) return fail(v === '1.2' ? '405' : '406', what);
+      if (rule.vocab && rule.vocab.indexOf(val) < 0 && !(rule.orNum && val !== '' && !isNaN(Number(val)))) return fail(v === '1.2' ? '405' : '406', what);
       if (rule.re && !rule.re.test(val)) return fail(v === '1.2' ? '405' : '406', what);
       if (rule.max && val.length > rule.max) return fail(v === '1.2' ? '405' : '407', what + ' (length ' + val.length + ')');
       if (rule.num && !(rule.blank && val === '')) {
@@ -194,19 +249,27 @@
   }
 
   var SHOW = {
-    '1.2': ['cmi.core.lesson_status', 'cmi.core.lesson_location', 'cmi.core.score.raw', 'cmi.core.session_time', 'cmi.core.exit', 'cmi.core.entry', 'cmi.suspend_data'],
-    '2004': ['cmi.completion_status', 'cmi.success_status', 'cmi.progress_measure', 'cmi.location', 'cmi.score.scaled', 'cmi.session_time', 'cmi.exit', 'cmi.entry', 'cmi.suspend_data'],
+    '1.2': ['cmi.core.lesson_status', 'cmi.core.score.raw', 'cmi.core.lesson_location', 'cmi.core.session_time', 'cmi.core.exit', 'cmi.core.entry', 'cmi.suspend_data'],
+    '2004': ['cmi.completion_status', 'cmi.success_status', 'cmi.score.raw', 'cmi.score.scaled', 'cmi.progress_measure', 'cmi.location', 'cmi.session_time', 'cmi.exit', 'cmi.entry', 'cmi.suspend_data'],
   };
   function render() {
     var t = document.getElementById('state');
     var rows = [['Session', session ? session.state : '-']];
     SHOW[version].forEach(function (k) { rows.push([k, store[k] == null ? '' : store[k]]); });
+    var n = 0;
+    while (store['cmi.interactions.' + n + '.id'] != null) n++;
+    rows.push(['interactions recorded', String(n)]);
+    for (var i = Math.max(0, n - 5); i < n; i++) {
+      var p = 'cmi.interactions.' + i + '.';
+      rows.push(['  #' + i + ' ' + store[p + 'id'], (store[p + 'result'] || '') + ' · ' + (store[p + (version === '1.2' ? 'student_response' : 'learner_response')] || '') + ' (correct ' + (store[p + 'correct_responses.0.pattern'] || '') + ')']);
+    }
     t.innerHTML = '';
     rows.forEach(function (r) {
       var tr = document.createElement('tr');
       var a = document.createElement('td'); a.textContent = r[0];
       var b = document.createElement('td'); b.textContent = r[1].length > 80 ? r[1].slice(0, 80) + '… (' + r[1].length + ' chars)' : r[1];
       if (/^(completed|passed)$/.test(r[1])) b.className = 'good';
+      if (/^(failed)$/.test(r[1])) b.className = 'bad';
       tr.appendChild(a); tr.appendChild(b); t.appendChild(tr);
     });
   }

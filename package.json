@@ -19,6 +19,7 @@
   },
   "devDependencies": {
     "fast-xml-parser": "^5.11.2",
+    "jsdom": "^29.1.1",
     "yauzl": "^3.4.0"
   }
 }

@@ -1,0 +1,5 @@
+Question,Type,Option A,Option B,Option C,Option D,Option E,Option F,Correct,Feedback
+"What should you do first when you discover a fire?",single,"Raise the alarm","Collect your belongings","Open all windows","Finish your task",,,A,"Raising the alarm warns everyone and starts the evacuation."
+"Which of these are safe evacuation behaviours? (Select all that apply)",multiple,"Use the stairs","Use the lift","Close doors behind you","Go back for your coat",,,A;C,"Lifts can fail in a fire; closing doors slows the spread."
+"A CO2 extinguisher is safe to use on electrical fires.",truefalse,True,False,,,,,A,"CO2 does not conduct electricity."
+"Where is the assembly point?",single,"Main car park","Reception","Canteen","Roof",,,A,

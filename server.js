@@ -10,10 +10,12 @@ const multer = require('multer');
 const { tools, detectType, officeToPdf, prepareVideo, DATA_DIR } = require('./src/converters');
 const { stagePackage, zipDir } = require('./src/packager');
 const { VERSIONS } = require('./src/manifest');
+const { normalizeCourse, CourseError, LIMITS } = require('./src/course');
 
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '127.0.0.1';
-const MAX_BYTES = 500 * 1024 * 1024;
+const MAX_FILE_BYTES = 500 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const JOB_TTL_MS = Number(process.env.JOB_TTL_HOURS || 6) * 3600 * 1000;
 const MAX_CONCURRENT = 2;
 
@@ -24,6 +26,10 @@ fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const ALLOWED_EXT = new Set(['.mp4', '.m4v', '.pdf', '.pptx', '.docx']);
 
+class HttpError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+
 // ---------------------------------------------------------------------------
 // Jobs
 // ---------------------------------------------------------------------------
@@ -33,6 +39,7 @@ const queue = [];
 let running = 0;
 
 function publicJob(job) {
+  const c = job.course;
   return {
     id: job.id,
     status: job.status,
@@ -40,11 +47,10 @@ function publicJob(job) {
     progress: Math.round(job.progress * 100),
     error: job.error || null,
     warnings: job.warnings,
-    title: job.options.title,
-    version: job.options.version,
-    versionLabel: VERSIONS[job.options.version].label,
-    kind: job.kind,
-    sourceName: job.sourceName,
+    title: c.title,
+    version: c.version,
+    versionLabel: VERSIONS[c.version].label,
+    items: c.items.map((it) => ({ id: it.id, type: it.type, title: it.title })),
     size: job.zipBytes || null,
     downloadUrl: job.status === 'done' ? `/api/jobs/${job.id}/download` : null,
     previewUrl: job.status === 'done' ? `/preview/${job.id}` : null,
@@ -61,53 +67,70 @@ function slug(s) {
     .replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 80) || 'scorm-package';
 }
 
+async function removeUploads(job) {
+  for (const u of Object.values(job.uploads)) await fsp.rm(u.path, { force: true }).catch(() => {});
+}
+
 async function processJob(job) {
   const dir = path.join(JOBS_DIR, job.id);
   const work = path.join(dir, 'work');
   const stageDir = path.join(dir, 'package');
   await fsp.mkdir(work, { recursive: true });
-
   job.status = 'processing';
-  let content;
 
-  if (job.kind === 'docx' || job.kind === 'pptx') {
-    setStage(job, 'Converting document to PDF', 0.05);
-    // LibreOffice names its output after the input, so give it a clean name.
-    const input = path.join(work, `source.${job.kind}`);
-    await fsp.rename(job.uploadPath, input);
-    const pdf = await officeToPdf(input, work);
-    content = { kind: 'pdf', file: pdf };
-    setStage(job, 'Document converted', 0.6);
-  } else if (job.kind === 'pdf') {
-    content = { kind: 'pdf', file: job.uploadPath };
-    setStage(job, 'Preparing document', 0.3);
-  } else {
-    const out = path.join(work, 'video.mp4');
-    const poster = path.join(work, 'poster.jpg');
-    setStage(job, 'Analysing video', 0.02);
-    const info = await prepareVideo(job.uploadPath, out, poster, {
-      onProgress: (p, label) => setStage(job, label, 0.02 + p * 0.68),
-    });
-    if (info.warning) job.warnings.push(info.warning);
-    if (info.transcoded) job.warnings.push('The video was re-encoded to H.264/AAC so it plays in every browser.');
-    content = { kind: 'video', file: out, poster: info.poster ? poster : null, duration: info.duration };
-    await fsp.rm(job.uploadPath, { force: true });
+  // Spread 0..0.7 of the progress bar over file items, weighted by size.
+  const fileItems = job.course.items.filter((it) => it.type === 'file');
+  const totalBytes = fileItems.reduce((n, it) => n + job.uploads[it.id].size, 0) || 1;
+  let doneBytes = 0;
+  const assets = {};
+
+  for (let i = 0; i < fileItems.length; i++) {
+    const it = fileItems[i];
+    const up = job.uploads[it.id];
+    const base = 0.7 * (doneBytes / totalBytes);
+    const span = 0.7 * (up.size / totalBytes);
+    const label = (s) => (fileItems.length > 1 ? `${s} (${i + 1} of ${fileItems.length}: ${it.title})` : s);
+    const itemDir = path.join(work, it.id);
+    await fsp.mkdir(itemDir, { recursive: true });
+
+    if (up.kind === 'docx' || up.kind === 'pptx') {
+      setStage(job, label('Converting document to PDF'), base);
+      // LibreOffice names its output after the input, so give it a clean name.
+      const input = path.join(itemDir, `source.${up.kind}`);
+      await fsp.rename(up.path, input);
+      up.path = input;
+      assets[it.id] = { kind: 'pdf', file: await officeToPdf(input, itemDir) };
+    } else if (up.kind === 'pdf') {
+      setStage(job, label('Preparing document'), base);
+      assets[it.id] = { kind: 'pdf', file: up.path };
+    } else {
+      const out = path.join(itemDir, 'video.mp4');
+      const poster = path.join(itemDir, 'poster.jpg');
+      setStage(job, label('Analysing video'), base);
+      const info = await prepareVideo(up.path, out, poster, {
+        onProgress: (p, l) => setStage(job, label(l), base + p * span),
+      });
+      if (info.warning) job.warnings.push(`${it.title}: ${info.warning}`);
+      if (info.transcoded) job.warnings.push(`${it.title}: re-encoded to H.264/AAC so it plays in every browser.`);
+      assets[it.id] = { kind: 'video', file: out, poster: info.poster ? poster : null };
+    }
+    doneBytes += up.size;
   }
 
   setStage(job, 'Building SCORM package', 0.72);
-  await stagePackage(stageDir, content, { ...job.options, id: `SCORMCONV_${job.id.replace(/-/g, '')}` });
+  await stagePackage(stageDir, job.course, assets, { id: `SCORMCONV_${job.id.replace(/-/g, '')}` });
 
   setStage(job, 'Compressing package', 0.75);
   const zipPath = path.join(dir, 'package.zip');
   const { bytes } = await zipDir(stageDir, zipPath, (p) => setStage(job, 'Compressing package', 0.75 + p * 0.24));
 
-  // Free the source files; the staged folder is kept for the preview.
+  // Free the sources; the staged folder is kept for the preview.
   await fsp.rm(work, { recursive: true, force: true });
-  await fsp.rm(job.uploadPath, { force: true }).catch(() => {});
+  await removeUploads(job);
 
   job.zipPath = zipPath;
   job.zipBytes = bytes;
-  job.fileName = `${slug(job.options.title)}_${job.options.version === '1.2' ? 'SCORM12' : 'SCORM2004'}.zip`;
+  job.fileName = `${slug(job.course.title)}_${job.course.version === '1.2' ? 'SCORM12' : 'SCORM2004'}.zip`;
   job.status = 'done';
   setStage(job, 'Ready', 1);
 }
@@ -121,7 +144,7 @@ function pump() {
         console.error(`[job ${job.id}]`, err.stderr || err);
         job.status = 'error';
         job.error = err.message || 'Conversion failed';
-        fsp.rm(job.uploadPath, { force: true }).catch(() => {});
+        removeUploads(job);
       })
       .finally(() => { running--; job.finishedAt = Date.now(); pump(); });
   }
@@ -158,77 +181,86 @@ const upload = multer({
     destination: UPLOAD_DIR,
     filename: (_req, _file, cb) => cb(null, crypto.randomUUID()),
   }),
-  limits: { fileSize: MAX_BYTES, files: 1, fields: 20 },
+  limits: { fileSize: MAX_FILE_BYTES, files: LIMITS.items, fields: 10, fieldSize: 8 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname || '').toLowerCase();
-    if (!ALLOWED_EXT.has(ext)) return cb(new UploadError(400, 'Unsupported file type. Upload an MP4, PDF, PPTX or DOCX file.'));
+    if (!ALLOWED_EXT.has(ext)) return cb(new HttpError(400, `"${file.originalname}" is not supported. Use MP4, PDF, PPTX or DOCX files.`));
     cb(null, true);
   },
 });
-
-class UploadError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
-}
 
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 
 app.get('/api/capabilities', (_req, res) => {
   res.json({
-    maxBytes: MAX_BYTES,
+    maxBytes: MAX_FILE_BYTES,
+    maxTotalBytes: MAX_TOTAL_BYTES,
+    maxItems: LIMITS.items,
     office: !!tools.soffice,
     ffmpeg: !!tools.ffmpeg,
     versions: Object.entries(VERSIONS).map(([id, v]) => ({ id, label: v.label })),
   });
 });
 
-app.post('/api/convert', (req, res) => {
-  upload.single('file')(req, res, async (err) => {
+// multipart/form-data:
+//   course: JSON (see src/course.js)
+//   file_<itemId>: one file per file item
+app.post('/api/courses', (req, res) => {
+  const declared = Number(req.headers['content-length'] || 0);
+  if (declared > MAX_TOTAL_BYTES + 16 * 1024 * 1024) {
+    return res.status(413).json({ error: 'The files add up to more than 2 GB. Split the course or compress the videos.' });
+  }
+
+  upload.any()(req, res, async (err) => {
+    const files = req.files || [];
     try {
       if (err) {
-        if (err.code === 'LIMIT_FILE_SIZE') throw new UploadError(413, 'File is larger than the 500 MB limit.');
-        if (err instanceof UploadError) throw err;
-        throw new UploadError(400, err.message || 'Upload failed');
-      }
-      if (!req.file) throw new UploadError(400, 'No file uploaded.');
-
-      const b = req.body || {};
-      const version = VERSIONS[b.version] ? b.version : '1.2';
-      const kind = await detectType(req.file.path, req.file.originalname);
-      if (!kind) throw new UploadError(400, 'The file content does not look like a valid MP4, PDF, PPTX or DOCX file.');
-      if ((kind === 'docx' || kind === 'pptx') && !tools.soffice) {
-        throw new UploadError(422, 'DOCX/PPTX conversion needs LibreOffice, which is not installed on this server.');
+        if (err.code === 'LIMIT_FILE_SIZE') throw new HttpError(413, 'Each file must be 500 MB or smaller.');
+        if (err.code === 'LIMIT_FILE_COUNT') throw new HttpError(413, `A course can have at most ${LIMITS.items} files.`);
+        if (err instanceof HttpError) throw err;
+        throw new HttpError(400, err.message || 'Upload failed');
       }
 
-      const defaultTitle = path.basename(req.file.originalname, path.extname(req.file.originalname));
-      const title = String(b.title || '').trim().slice(0, 200) || defaultTitle;
-      const threshold = Math.max(1, Math.min(100, parseInt(b.threshold, 10) || (kind === 'mp4' ? 95 : 100)));
+      let raw;
+      try { raw = JSON.parse((req.body && req.body.course) || ''); } catch { throw new HttpError(400, 'Missing or invalid course data.'); }
+      const course = normalizeCourse(raw);
+
+      const byField = new Map(files.map((f) => [f.fieldname, f]));
+      const uploads = {};
+      for (const it of course.items) {
+        if (it.type !== 'file') continue;
+        const f = byField.get(`file_${it.id}`);
+        if (!f) throw new HttpError(400, `No file was uploaded for "${it.title}".`);
+        const kind = await detectType(f.path, f.originalname);
+        if (!kind) throw new HttpError(400, `"${f.originalname}" does not look like a valid MP4, PDF, PPTX or DOCX file.`);
+        if ((kind === 'docx' || kind === 'pptx') && !tools.soffice) {
+          throw new HttpError(422, 'DOCX/PPTX conversion needs LibreOffice, which is not installed on this server.');
+        }
+        uploads[it.id] = { path: f.path, originalName: f.originalname, size: f.size, kind };
+      }
+      // Drop any stray files that don't belong to an item.
+      const used = new Set(Object.values(uploads).map((u) => u.path));
+      for (const f of files) if (!used.has(f.path)) fsp.rm(f.path, { force: true }).catch(() => {});
 
       const job = {
         id: crypto.randomUUID(),
-        kind,
-        sourceName: req.file.originalname,
-        uploadPath: req.file.path,
+        course,
+        uploads,
         status: 'queued',
         stage: 'Waiting in queue',
         progress: 0,
         warnings: [],
         createdAt: Date.now(),
-        options: {
-          title,
-          version,
-          completion: { mode: b.completion === 'launch' ? 'launch' : 'progress', threshold },
-          passOnComplete: b.passOnComplete === 'true',
-          reportScore: b.reportScore === 'true',
-          restrictSeek: b.restrictSeek === 'true',
-        },
       };
       jobs.set(job.id, job);
       queue.push(job);
       pump();
       res.status(202).json(publicJob(job));
     } catch (e) {
-      if (req.file) fsp.rm(req.file.path, { force: true }).catch(() => {});
-      res.status(e.status || 500).json({ error: e.message || 'Server error' });
+      for (const f of files) fsp.rm(f.path, { force: true }).catch(() => {});
+      const status = e instanceof CourseError ? 400 : e.status || 500;
+      if (status === 500) console.error(e);
+      res.status(status).json({ error: e.message || 'Server error' });
     }
   });
 });
@@ -289,5 +321,5 @@ const server = app.listen(PORT, HOST, () => {
   console.log(`  ffmpeg:      ${tools.ffmpeg || 'NOT FOUND (videos copied as-is)'}`);
 });
 // Large uploads over slow links can take a long time.
-server.requestTimeout = 60 * 60 * 1000;
+server.requestTimeout = 2 * 60 * 60 * 1000;
 server.headersTimeout = 65 * 1000;

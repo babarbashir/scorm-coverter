@@ -7,21 +7,38 @@
 <title>{{TITLE}}</title>
 <link rel="stylesheet" href="player/player.css">
 </head>
-<body class="type-{{TYPE}}">
+<body>
 <div id="app">
   <header class="bar">
+    <button type="button" id="menu-toggle" class="icon-btn" aria-controls="menu" aria-expanded="false" aria-label="Course menu">
+      <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M3 6h18v2H3V6Zm0 5h18v2H3v-2Zm0 5h18v2H3v-2Z"/></svg>
+    </button>
     <h1 class="title">{{TITLE}}</h1>
     <div class="progress" aria-live="polite">
-      <div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Progress"><span id="meter-fill"></span></div>
+      <div class="meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Course progress"><span id="meter-fill"></span></div>
       <span id="status-text">Loading…</span>
     </div>
   </header>
-  <main id="stage"></main>
+  <div class="body">
+    <nav id="menu" aria-label="Course contents">
+      <ol id="menu-list"></ol>
+    </nav>
+    <section class="content">
+      <div class="item-bar">
+        <button type="button" class="btn" id="prev-item" aria-label="Previous section">&#8249;</button>
+        <h2 id="item-title"></h2>
+        <button type="button" class="btn" id="next-item" aria-label="Next section">&#8250;</button>
+      </div>
+      <main id="stage"></main>
+    </section>
+  </div>
 </div>
 <div id="toast" role="status" aria-live="polite"></div>
 <script src="player/config.js"></script>
 <script src="player/scorm-api.js"></script>
 {{PDFJS}}
+<script src="player/viewers.js"></script>
+<script src="player/quiz.js"></script>
 <script src="player/player.js"></script>
 </body>
 </html>

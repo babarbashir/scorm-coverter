@@ -40,13 +40,26 @@ function htmlEscape(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+// Correct answers ship lightly obfuscated so they aren't readable at a
+// glance in config.js. Mirrors decodeKey() in templates/player/quiz.js.
+function encodeKey(indexes, salt) {
+  const s = indexes.join(',');
+  const out = Buffer.alloc(s.length);
+  for (let i = 0; i < s.length; i++) {
+    out[i] = s.charCodeAt(i) ^ salt.charCodeAt(i % salt.length) ^ ((i * 31) & 255);
+  }
+  return out.toString('base64');
+}
+
+const PLAYER_FILES = ['scorm-api.js', 'viewers.js', 'quiz.js', 'player.js', 'player.css'];
+
 /**
  * Builds the unpacked SCORM package in `stageDir`.
- * content: { kind: 'pdf'|'video', file: absolute path, poster?: absolute path, duration? }
- * options: { title, version, completion: { mode: 'launch'|'progress', threshold }, passOnComplete, reportScore, restrictSeek }
+ * course: normalised course (src/course.js)
+ * assets: { [itemId]: { kind: 'pdf'|'video', file, poster? } } for file items
  */
-async function stagePackage(stageDir, content, options) {
-  const { version } = options;
+async function stagePackage(stageDir, course, assets, { id }) {
+  const { version } = course;
   if (!VERSIONS[version]) throw new Error(`Unknown SCORM version: ${version}`);
 
   await fsp.rm(stageDir, { recursive: true, force: true });
@@ -57,50 +70,75 @@ async function stagePackage(stageDir, content, options) {
   // conformance rules and checked by several LMS importers).
   await copyDir(path.join(SCHEMA_DIR, VERSIONS[version].schemaDir), stageDir);
 
-  for (const f of ['scorm-api.js', 'player.js', 'player.css']) {
+  for (const f of PLAYER_FILES) {
     await fsp.copyFile(path.join(TEMPLATE_DIR, f), path.join(stageDir, 'player', f));
   }
 
-  let src;
-  if (content.kind === 'pdf') {
-    src = 'content/document.pdf';
-    await linkOrCopy(content.file, path.join(stageDir, src));
-    await copyDir(PDFJS_DIR, path.join(stageDir, 'player', 'pdfjs'));
-  } else {
-    src = 'content/video.mp4';
-    await linkOrCopy(content.file, path.join(stageDir, src));
-    if (content.poster) await fsp.copyFile(content.poster, path.join(stageDir, 'content', 'poster.jpg'));
+  let hasPdf = false;
+  const items = [];
+  for (let i = 0; i < course.items.length; i++) {
+    const it = course.items[i];
+    const n = String(i + 1).padStart(2, '0');
+    if (it.type === 'quiz') {
+      items.push({
+        id: it.id,
+        kind: 'quiz',
+        title: it.title,
+        required: it.required,
+        parent: it.attachedTo || null,
+        quiz: {
+          ...it.quiz,
+          questions: it.quiz.questions.map((q, qi) => ({
+            type: q.type, text: q.text, options: q.options, feedback: q.feedback,
+            k: encodeKey(q.correct, `${it.id}:${qi}`),
+          })),
+        },
+      });
+      continue;
+    }
+    const asset = assets[it.id];
+    if (!asset) throw new Error(`Missing file for "${it.title}".`);
+    const entry = { id: it.id, kind: asset.kind, title: it.title, required: it.required, threshold: it.threshold };
+    if (asset.kind === 'pdf') {
+      hasPdf = true;
+      entry.src = `content/${n}-document.pdf`;
+      await linkOrCopy(asset.file, path.join(stageDir, entry.src));
+    } else {
+      entry.src = `content/${n}-video.mp4`;
+      entry.restrictSeek = it.restrictSeek;
+      await linkOrCopy(asset.file, path.join(stageDir, entry.src));
+      if (asset.poster) {
+        entry.poster = `content/${n}-poster.jpg`;
+        await fsp.copyFile(asset.poster, path.join(stageDir, entry.poster));
+      }
+    }
+    items.push(entry);
   }
+  if (hasPdf) await copyDir(PDFJS_DIR, path.join(stageDir, 'player', 'pdfjs'));
 
   const config = {
-    title: options.title,
-    type: content.kind,
-    src,
-    poster: content.kind === 'video' && content.poster ? 'content/poster.jpg' : null,
+    title: course.title,
     version: version === '1.2' ? '1.2' : '2004',
-    completion: {
-      mode: options.completion.mode === 'launch' ? 'launch' : 'progress',
-      threshold: Math.max(1, Math.min(100, Number(options.completion.threshold) || 100)),
-    },
-    passOnComplete: !!options.passOnComplete,
-    reportScore: !!options.reportScore,
-    restrictSeek: !!options.restrictSeek,
+    navigation: course.navigation,
+    passOnComplete: course.passOnComplete,
+    reportScore: course.reportScore,
+    recordInteractions: course.recordInteractions,
+    items,
   };
   await fsp.writeFile(
     path.join(stageDir, 'player', 'config.js'),
-    `window.SCORM_CONFIG = ${JSON.stringify(config, null, 2).replace(/</g, '\\u003c')};\n`,
+    `window.SCORM_CONFIG = ${JSON.stringify(config, null, 2).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029')};\n`,
   );
 
   const template = await fsp.readFile(path.join(TEMPLATE_DIR, 'index.html'), 'utf8');
   const html = template
-    .replace(/\{\{TITLE\}\}/g, htmlEscape(options.title))
-    .replace(/\{\{TYPE\}\}/g, content.kind)
-    .replace('{{PDFJS}}', content.kind === 'pdf' ? '<script src="player/pdfjs/pdf.min.js"></script>' : '');
+    .replace(/\{\{TITLE\}\}/g, htmlEscape(course.title))
+    .replace('{{PDFJS}}', hasPdf ? '<script src="player/pdfjs/pdf.min.js"></script>' : '');
   await fsp.writeFile(path.join(stageDir, 'index.html'), html);
 
   // Manifest lists every file except itself and the schema files.
   const files = (await listFiles(stageDir)).filter((f) => !/\.(xsd|dtd)$/.test(f));
-  const xml = buildManifest(version, { id: options.id, title: options.title, files, launch: 'index.html' });
+  const xml = buildManifest(version, { id, title: course.title, files, launch: 'index.html' });
   await fsp.writeFile(path.join(stageDir, 'imsmanifest.xml'), xml);
 
   return { files: await listFiles(stageDir) };
